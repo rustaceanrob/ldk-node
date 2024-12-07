@@ -70,6 +70,7 @@ base64 = { version = "0.22.1", default-features = false, features = ["std"] }
 rand = "0.8.5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tokio = { version = "1.37", default-features = false, features = [ "rt-multi-thread", "time", "sync", "macros" ] }
+kyoto-cbf = { git = "https://github.com/rustaceanrob/kyoto.git", rev = "43842ba07cd6445cd3d1ae11d3fcb98ee9bbb58c", default-features = false, features = ["dns", "database", "filter-control"] }
 esplora-client = { version = "0.9", default-features = false }
 libc = "0.2"
 uniffi = { version = "0.27.3", features = ["build"], optional = true }

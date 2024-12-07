@@ -240,7 +240,10 @@ impl Node {
 		let chain_source = Arc::clone(&self.chain_source);
 		let runtime_ref = &runtime;
 		tokio::task::block_in_place(move || {
-			runtime_ref.block_on(async move { chain_source.update_fee_rate_estimates().await })
+			runtime_ref.block_on(async move { 
+				chain_source.start_background_tasks(runtime_ref).await;
+				chain_source.update_fee_rate_estimates().await
+			})
 		})?;
 
 		// Spawn background task continuously syncing onchain, lightning, and fee rate cache.
@@ -1234,6 +1237,9 @@ impl Node {
 							chain_source
 								.poll_and_update_listeners(sync_cman, sync_cmon, sync_sweeper)
 								.await?;
+						},
+						ChainSource::Kyoto { .. } => {
+							chain_source.update_fee_rate_estimates().await?;
 						},
 					}
 					Ok(())

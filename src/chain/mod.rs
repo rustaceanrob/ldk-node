@@ -6,6 +6,7 @@
 // accordance with one or both of these licenses.
 
 mod bitcoind_rpc;
+mod cbf;
 
 use crate::chain::bitcoind_rpc::{
 	BitcoindRpcClient, BoundedHeaderCache, ChainListener, FeeRateEstimationMode,
@@ -25,8 +26,13 @@ use crate::logger::{log_bytes, log_error, log_info, log_trace, FilesystemLogger,
 use crate::types::{Broadcaster, ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, NodeMetrics};
 
+use ::kyoto::core::builder::NodeDefault;
+use ::kyoto::{Client as KyotoClient, TxBroadcast, TxBroadcastPolicy};
+use cbf::{ChainEvent, ChainFetcher, ChainRequest};
+use kyoto::{NodeMessage, ScriptBuf};
 use lightning::chain::chaininterface::ConfirmationTarget as LdkConfirmationTarget;
 use lightning::chain::{Confirm, Filter, Listen};
+use lightning::log_warn;
 use lightning::util::ser::Writeable;
 
 use lightning_transaction_sync::EsploraSyncClient;
@@ -40,8 +46,9 @@ use bdk_esplora::EsploraAsyncExt;
 use esplora_client::AsyncClient as EsploraAsyncClient;
 
 use bitcoin::{FeeRate, Network};
+use tokio::sync::mpsc::{Receiver, UnboundedSender};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -134,6 +141,23 @@ pub(crate) enum ChainSource {
 		logger: Arc<FilesystemLogger>,
 		node_metrics: Arc<RwLock<NodeMetrics>>,
 	},
+	Kyoto {
+		client: Arc<KyotoClient>,
+		node: Arc<NodeDefault>,
+		tx: Arc<UnboundedSender<ChainRequest>>,
+		rx: Arc<tokio::sync::Mutex<Receiver<ChainEvent>>>,
+		chain_fetcher: Arc<ChainFetcher>,
+		script_set: tokio::sync::Mutex<HashSet<ScriptBuf>>,
+		latest_chain_tip: RwLock<Option<ValidatedBlockHeader>>,
+		onchain_wallet: Arc<Wallet>,
+		wallet_polling_status: Mutex<WalletSyncStatus>,
+		fee_estimator: Arc<OnchainFeeEstimator>,
+		tx_broadcaster: Arc<Broadcaster>,
+		kv_store: Arc<DynStore>,
+		config: Arc<Config>,
+		logger: Arc<FilesystemLogger>,
+		node_metrics: Arc<RwLock<NodeMetrics>>,
+	},
 }
 
 impl ChainSource {
@@ -189,6 +213,55 @@ impl ChainSource {
 			config,
 			logger,
 			node_metrics,
+		}
+	}
+
+	pub(crate) fn new_kyoto(
+		client: Arc<KyotoClient>, node: Arc<NodeDefault>, onchain_wallet: Arc<Wallet>,
+		fee_estimator: Arc<OnchainFeeEstimator>, script_set: HashSet<ScriptBuf>,
+		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, config: Arc<Config>,
+		logger: Arc<FilesystemLogger>, node_metrics: Arc<RwLock<NodeMetrics>>,
+	) -> Self {
+		let latest_chain_tip = RwLock::new(None);
+		let wallet_polling_status = Mutex::new(WalletSyncStatus::Completed);
+		let (tx, rx) = tokio::sync::mpsc::channel(32);
+		let event_receiver = tokio::sync::Mutex::new(rx);
+		let (requester, rx) = tokio::sync::mpsc::unbounded_channel();
+		let chain_requester = Arc::new(requester);
+		let chain_fetcher = ChainFetcher::new(tx, rx, Arc::clone(&client));
+		Self::Kyoto {
+			client,
+			node,
+			tx: chain_requester,
+			rx: Arc::new(event_receiver),
+			chain_fetcher: Arc::new(chain_fetcher),
+			script_set: tokio::sync::Mutex::new(script_set),
+			latest_chain_tip,
+			onchain_wallet,
+			wallet_polling_status,
+			fee_estimator,
+			tx_broadcaster,
+			kv_store,
+			config,
+			logger,
+			node_metrics,
+		}
+	}
+
+	pub(crate) async fn start_background_tasks(&self, runtime: &Arc<tokio::runtime::Runtime>) {
+		match self {
+			Self::BitcoindRpc { .. } => (),
+			Self::Esplora { .. } => (),
+			Self::Kyoto { node, chain_fetcher, .. } => {
+				let node = Arc::clone(&node);
+				let fetcher = Arc::clone(&chain_fetcher);
+				runtime.spawn(async move {
+					node.run().await;
+				});
+				runtime.spawn(async move {
+					fetcher.listen_for_requests().await;
+				});
+			},
 		}
 	}
 
@@ -385,6 +458,79 @@ impl ChainSource {
 					}
 				}
 			},
+			Self::Kyoto {
+				client,
+				tx,
+				rx,
+				script_set,
+				latest_chain_tip,
+				onchain_wallet,
+				wallet_polling_status,
+				logger,
+				..
+			} => {
+				{
+					let mut status_lock = wallet_polling_status.lock().unwrap();
+					if status_lock.register_or_subscribe_pending_sync().is_some() {
+						debug_assert!(false, "Sync already in progress. This should never happen.");
+					}
+				}
+				let mut fee_rate_update_interval =
+					tokio::time::interval(Duration::from_secs(CHAIN_POLLING_INTERVAL_SECS));
+				let mut event_receiver = client.receiver();
+				let mut chain_receiver = rx.lock().await;
+				loop {
+					tokio::select! {
+						_ = stop_sync_receiver.changed() => {
+							log_trace!(
+								logger,
+								"Stopping polling for new chain data.",
+							);
+							return;
+						}
+						_ = event_receiver.recv() => {
+							if let Ok(event) = event_receiver.recv().await {
+								match event {
+										NodeMessage::Dialog(d) => log_info!(logger, "{d}"),
+										NodeMessage::Warning(warning) => log_warn!(logger, "{warning}"),
+										NodeMessage::Synced(_) => {
+											wallet_polling_status.lock().unwrap().propagate_result_to_subscribers(Ok(()));
+										},
+										NodeMessage::IndexedFilter(mut indexed_filter) => {
+											let scripts = script_set.lock().await;
+											if indexed_filter.contains_any(&scripts).await {
+												tx.send(ChainRequest::Block(*indexed_filter.block_hash())).unwrap();
+											} else {
+												tx.send(ChainRequest::Header(indexed_filter.height())).unwrap();
+											}
+										},
+										_ => (),
+									}
+							}
+						}
+						_ = chain_receiver.recv() => {
+							if let Some(event) = chain_receiver.recv().await {
+								match event {
+									ChainEvent::Header(indexed_header) => {
+										chain_monitor.filtered_block_connected(&indexed_header.header, &[], indexed_header.height);
+										channel_manager.filtered_block_connected(&indexed_header.header, &[], indexed_header.height);
+										output_sweeper.filtered_block_connected(&indexed_header.header, &[], indexed_header.height);
+									},
+									ChainEvent::Block(indexed_block) => {
+										chain_monitor.block_connected(&indexed_block.block, indexed_block.height);
+										channel_manager.block_connected(&indexed_block.block, indexed_block.height);
+										output_sweeper.block_connected(&indexed_block.block, indexed_block.height);
+										onchain_wallet.block_connected(&indexed_block.block, indexed_block.height);
+									},
+								}
+							}
+						}
+						_ = fee_rate_update_interval.tick() => {
+							let _ = self.update_fee_rate_estimates().await;
+						}
+					}
+				}
+			},
 		}
 	}
 
@@ -510,6 +656,9 @@ impl ChainSource {
 				// `ChainPoller`. So nothing to do here.
 				unreachable!("Onchain wallet will be synced via chain polling")
 			},
+			Self::Kyoto { .. } => {
+				unreachable!("")
+			},
 		}
 	}
 
@@ -608,6 +757,9 @@ impl ChainSource {
 				// In BitcoindRpc mode we sync lightning and onchain wallet in one go by via
 				// `ChainPoller`. So nothing to do here.
 				unreachable!("Lightning wallet will be synced via chain polling")
+			},
+			Self::Kyoto { .. } => {
+				unreachable!("")
 			},
 		}
 	}
@@ -742,6 +894,9 @@ impl ChainSource {
 				let res = Ok(());
 				wallet_polling_status.lock().unwrap().propagate_result_to_subscribers(res);
 				res
+			},
+			Self::Kyoto { .. } => {
+				unreachable!("")
 			},
 		}
 	}
@@ -967,6 +1122,20 @@ impl ChainSource {
 
 				Ok(())
 			},
+			Self::Kyoto { logger, fee_estimator, .. } => {
+				let confirmation_targets = get_all_conf_targets();
+				let mut new_fee_rate_cache = HashMap::with_capacity(10);
+				for target in confirmation_targets {
+					let fee_rate = FeeRate::from_sat_per_kwu(250);
+					let adjusted_fee_rate = apply_post_estimation_adjustments(target, fee_rate);
+					new_fee_rate_cache.insert(target, adjusted_fee_rate);
+				}
+				if fee_estimator.set_fee_rate_cache(new_fee_rate_cache) {
+					// We only log if the values changed, as it might be very spammy otherwise.
+					log_info!(logger, "Fee rate cache update",);
+				}
+				Ok(())
+			},
 		}
 	}
 
@@ -1102,6 +1271,58 @@ impl ChainSource {
 					}
 				}
 			},
+			Self::Kyoto { client, tx_broadcaster, logger, .. } => {
+				let mut receiver = tx_broadcaster.get_broadcast_queue().await;
+				while let Some(next_package) = receiver.recv().await {
+					for tx in &next_package {
+						let txid = tx.compute_txid();
+						let timeout_fut = tokio::time::timeout(
+							Duration::from_secs(TX_BROADCAST_TIMEOUT_SECS),
+							client.broadcast_tx(TxBroadcast::new(
+								tx.clone(),
+								TxBroadcastPolicy::AllPeers,
+							)),
+						);
+						match timeout_fut.await {
+							Ok(res) => match res {
+								Ok(()) => {
+									log_trace!(
+										logger,
+										"Successfully broadcast transaction {}",
+										txid
+									);
+								},
+								Err(e) => {
+									log_error!(
+										logger,
+										"Failed to broadcast transaction {}: {}",
+										txid,
+										e
+									);
+									log_trace!(
+										logger,
+										"Failed broadcast transaction bytes: {}",
+										log_bytes!(tx.encode())
+									);
+								},
+							},
+							Err(e) => {
+								log_error!(
+									logger,
+									"Failed to broadcast transaction due to timeout {}: {}",
+									txid,
+									e
+								);
+								log_trace!(
+									logger,
+									"Failed broadcast transaction bytes: {}",
+									log_bytes!(tx.encode())
+								);
+							},
+						}
+					}
+				}
+			},
 		}
 	}
 }
@@ -1111,12 +1332,18 @@ impl Filter for ChainSource {
 		match self {
 			Self::Esplora { tx_sync, .. } => tx_sync.register_tx(txid, script_pubkey),
 			Self::BitcoindRpc { .. } => (),
+			Self::Kyoto { script_set, .. } => {
+				script_set.blocking_lock().insert(script_pubkey.into());
+			},
 		}
 	}
 	fn register_output(&self, output: lightning::chain::WatchedOutput) {
 		match self {
 			Self::Esplora { tx_sync, .. } => tx_sync.register_output(output),
 			Self::BitcoindRpc { .. } => (),
+			Self::Kyoto { script_set, .. } => {
+				script_set.blocking_lock().insert(output.script_pubkey);
+			},
 		}
 	}
 }
